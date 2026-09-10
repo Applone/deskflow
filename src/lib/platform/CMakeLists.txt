@@ -151,6 +151,8 @@ elseif(UNIX)
       EiKeyState.h
       EiScreen.cpp
       EiScreen.h
+      WaylandKeyboardManager.cpp
+      WaylandKeyboardManager.h
     )
     # The Portal sources also require EI.
     if(LIBPORTAL_FOUND)

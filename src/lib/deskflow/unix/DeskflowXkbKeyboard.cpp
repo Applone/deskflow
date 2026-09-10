@@ -7,6 +7,9 @@
 
 #if WINAPI_XWINDOWS
 #include "base/Log.h"
+#include "common/PlatformInfo.h"
+#include "platform/WaylandKeyboardManager.h"
+#include <cstring>
 #include <memory>
 
 #include "DeskflowXkbKeyboard.h" // Include last due to X11 use
@@ -15,6 +18,15 @@ namespace deskflow::linux {
 
 DeskflowXkbKeyboard::DeskflowXkbKeyboard()
 {
+  if (deskflow::platform::isWayland()) {
+    std::string layouts, variants;
+    if (deskflow::platform::WaylandKeyboardManager::instance().getLayouts(layouts, variants)) {
+      m_data.layout = strdup(layouts.c_str());
+      m_data.variant = strdup(variants.c_str());
+      return;
+    }
+  }
+
   using XkbDisplay = std::unique_ptr<Display, decltype(&XCloseDisplay)>;
   XkbDisplay display(XkbOpenDisplay(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr), &XCloseDisplay);
 

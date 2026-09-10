@@ -12,6 +12,7 @@
 #include "common/PlatformInfo.h"
 
 #if WINAPI_XWINDOWS
+#include "platform/WaylandKeyboardManager.h"
 #include <X11/XKBlib.h>
 #include <deskflow/unix/XkbLayoutsParser.h>
 #elif defined(Q_OS_MACOS)
@@ -85,9 +86,13 @@ std::vector<std::string> AppUtilUnix::getKeyboardLayoutList()
 // TODO: read the layout for x and wayland via xkbcommon
 std::string AppUtilUnix::getCurrentLanguageCode()
 {
+#if WINAPI_XWINDOWS
+  if (deskflow::platform::isWayland()) {
+    return deskflow::platform::WaylandKeyboardManager::instance().getActiveLanguage();
+  }
+#endif
+
   std::string result = "";
-  if (deskflow::platform::isWayland())
-    return result;
 
 #if WINAPI_XWINDOWS
 

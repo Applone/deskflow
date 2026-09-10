@@ -12,6 +12,7 @@
 #include "common/Settings.h"
 #include "deskflow/AppUtil.h"
 #include "platform/XDGKeyUtil.h"
+#include "platform/WaylandKeyboardManager.h"
 
 #include <cstddef>
 #include <memory>
@@ -38,13 +39,25 @@ void EiKeyState::initDefaultKeymap()
 {
   if (m_xkbKeymap) {
     xkb_keymap_unref(m_xkbKeymap);
+    m_xkbKeymap = nullptr;
   }
-  m_xkbKeymap = xkb_keymap_new_from_names(m_xkb, nullptr, XKB_KEYMAP_COMPILE_NO_FLAGS);
+
+  std::string layouts, variants;
+  if (deskflow::platform::WaylandKeyboardManager::instance().getLayouts(layouts, variants)) {
+    xkb_rule_names names = {};
+    names.layout = layouts.c_str();
+    names.variant = variants.empty() ? nullptr : variants.c_str();
+    m_xkbKeymap = xkb_keymap_new_from_names(m_xkb, &names, XKB_KEYMAP_COMPILE_NO_FLAGS);
+  }
+  if (!m_xkbKeymap) {
+    m_xkbKeymap = xkb_keymap_new_from_names(m_xkb, nullptr, XKB_KEYMAP_COMPILE_NO_FLAGS);
+  }
 
   if (m_xkbState) {
     xkb_state_unref(m_xkbState);
   }
   m_xkbState = xkb_state_new(m_xkbKeymap);
+  setActiveGroup(pollActiveGroup());
 }
 
 void EiKeyState::init(int fd, size_t len)
@@ -76,10 +89,28 @@ void EiKeyState::init(int fd, size_t len)
   }
   m_xkbKeymap = keymap;
 
+  // If the keymap supplied by EIS has only 1 layout, check if the desktop environment
+  // has multiple layouts configured and augment if needed
+  if (xkb_keymap_num_layouts(m_xkbKeymap) <= 1) {
+    std::string layouts, variants;
+    if (deskflow::platform::WaylandKeyboardManager::instance().getLayouts(layouts, variants) &&
+        layouts.find(',') != std::string::npos) {
+      xkb_rule_names names = {};
+      names.layout = layouts.c_str();
+      names.variant = variants.empty() ? nullptr : variants.c_str();
+      auto multiKeymap = xkb_keymap_new_from_names(m_xkb, &names, XKB_KEYMAP_COMPILE_NO_FLAGS);
+      if (multiKeymap) {
+        xkb_keymap_unref(m_xkbKeymap);
+        m_xkbKeymap = multiKeymap;
+      }
+    }
+  }
+
   if (m_xkbState) {
     xkb_state_unref(m_xkbState);
   }
   m_xkbState = xkb_state_new(m_xkbKeymap);
+  setActiveGroup(pollActiveGroup());
 }
 
 EiKeyState::~EiKeyState()
@@ -104,7 +135,28 @@ KeyModifierMask EiKeyState::pollActiveModifiers() const
 
 std::int32_t EiKeyState::pollActiveGroup() const
 {
+  if (m_screen) {
+    auto group = deskflow::platform::WaylandKeyboardManager::instance().getActiveGroup();
+    if (group >= 0) {
+      const_cast<EiKeyState *>(this)->setActiveGroup(group);
+      return group;
+    }
+  }
   return xkb_state_serialize_layout(m_xkbState, XKB_STATE_LAYOUT_EFFECTIVE);
+}
+
+void EiKeyState::setActiveGroup(std::int32_t group)
+{
+  if (!m_xkbState || group < 0)
+    return;
+
+  const auto current = xkb_state_serialize_layout(m_xkbState, XKB_STATE_LAYOUT_EFFECTIVE);
+  if (current != static_cast<xkb_layout_index_t>(group)) {
+    const auto depMods = xkb_state_serialize_mods(m_xkbState, XKB_STATE_MODS_DEPRESSED);
+    const auto latMods = xkb_state_serialize_mods(m_xkbState, XKB_STATE_MODS_LATCHED);
+    const auto lockMods = xkb_state_serialize_mods(m_xkbState, XKB_STATE_MODS_LOCKED);
+    xkb_state_update_mask(m_xkbState, depMods, latMods, lockMods, 0, 0, static_cast<xkb_layout_index_t>(group));
+  }
 }
 
 void EiKeyState::pollPressedKeys(KeyButtonSet &) const
@@ -315,21 +367,25 @@ void EiKeyState::fakeKey(const Keystroke &keystroke)
 
 KeyID EiKeyState::mapKeyFromKeyval(uint32_t keyval) const
 {
-  // Get the base keysym from level 0, ignoring current modifiers.
-  // We need this because with newer xkeyboard-config, function keys use CTRL+ALT type,
-  // and xkb_state_key_get_one_sym() would return XF86_Switch_VT_* when Ctrl+Alt are
-  // pressed, instead of F1. We want to send F1 + modifiers to the server, not the
-  // VT switch action.
-  const auto shifted = xkb_keymap_num_levels_for_key(m_xkbKeymap, keyval, 0);
-  const xkb_keysym_t *syms;
-  int nsyms = xkb_keymap_key_get_syms_by_level(m_xkbKeymap, keyval, 0, shifted, &syms);
+  const auto layout = static_cast<xkb_layout_index_t>(std::max(0, pollActiveGroup()));
+  const_cast<EiKeyState *>(this)->setActiveGroup(layout);
 
-  xkb_keysym_t xkbKeysym;
-  if (nsyms > 0) {
-    xkbKeysym = syms[0];
-  } else {
-    // Fallback to state-based lookup if level 0 has no symbols
-    xkbKeysym = xkb_state_key_get_one_sym(m_xkbState, keyval);
+  xkb_keysym_t xkbKeysym = xkb_state_key_get_one_sym(m_xkbState, keyval);
+
+  // Newer xkeyboard-config maps Ctrl+Alt+F<N> to XF86Switch_VT_<N>.
+  // Send the function key itself (from level 0), not the VT switch action.
+  if (xkbKeysym >= 0x1008fe01 && xkbKeysym <= 0x1008fe0c) {
+    const xkb_keysym_t *syms = nullptr;
+    if (xkb_keymap_key_get_syms_by_level(m_xkbKeymap, keyval, layout, 0, &syms) > 0) {
+      xkbKeysym = syms[0];
+    }
+  }
+
+  if (xkbKeysym == XKB_KEY_NoSymbol) {
+    const xkb_keysym_t *syms = nullptr;
+    if (xkb_keymap_key_get_syms_by_level(m_xkbKeymap, keyval, layout, 0, &syms) > 0) {
+      xkbKeysym = syms[0];
+    }
   }
 
   auto keysym = static_cast<KeySym>(xkbKeysym);
@@ -348,7 +404,7 @@ void EiKeyState::updateXkbState(uint32_t keyval, bool isPressed)
 void EiKeyState::clearStaleModifiers()
 {
   const auto lockedMods = xkb_state_serialize_mods(m_xkbState, XKB_STATE_MODS_LOCKED);
-  const auto lockedLayout = xkb_state_serialize_layout(m_xkbState, XKB_STATE_LAYOUT_LOCKED);
+  const auto effectiveLayout = static_cast<xkb_layout_index_t>(std::max(0, pollActiveGroup()));
 
   // Recreate the XKB state to clear stuck depressed modifiers that happen when
   // modifier keys are pressed on the client and released on the server. Locked
@@ -358,6 +414,6 @@ void EiKeyState::clearStaleModifiers()
     xkb_state_unref(m_xkbState);
   }
   m_xkbState = xkb_state_new(m_xkbKeymap);
-  xkb_state_update_mask(m_xkbState, 0, 0, lockedMods, 0, 0, lockedLayout);
+  xkb_state_update_mask(m_xkbState, 0, 0, lockedMods, 0, 0, effectiveLayout);
 }
 } // namespace deskflow

@@ -65,9 +65,44 @@ xkb_symbols "test" {
 };
 };)XKB";
 
+const char MultiLayoutKeymap[] = R"XKB(xkb_keymap {
+xkb_keycodes "test" {
+    minimum = 8;
+    maximum = 255;
+    <LFSH> = 50;
+    <AC01> = 38;
+};
+xkb_types "test" {
+    type "ALPHABETIC" {
+        modifiers = Shift;
+        map[Shift] = Level2;
+        level_name[Level1] = "Base";
+        level_name[Level2] = "Caps";
+    };
+};
+xkb_compat "test" {
+    interpret Shift_L+AnyOfOrNone(all) {
+        action = SetMods(modifiers=Shift);
+    };
+};
+xkb_symbols "test" {
+    name[1] = "English (US)";
+    name[2] = "Russian";
+    key <LFSH> { [ Shift_L ] };
+    modifier_map Shift { <LFSH> };
+    key <AC01> {
+        type[Group1] = "ALPHABETIC",
+        type[Group2] = "ALPHABETIC",
+        symbols[1] = [ 0x0061, 0x0041 ],
+        symbols[2] = [ 0x06c6, 0x06e6 ]
+    };
+};
+};)XKB";
+
 // XKB keycodes for TestKeymap.
 constexpr std::uint32_t LeftShiftKeycode = 50;
 constexpr std::uint32_t NumLockKeycode = 77;
+constexpr std::uint32_t KeyAKeycode = 38;
 } // namespace
 
 void EiKeyStateTests::initTestCase()
@@ -100,6 +135,40 @@ void EiKeyStateTests::clearStaleModifiers_shiftDownAndNumLockOn_shiftClearedAndN
 
   QVERIFY((keyState.pollActiveModifiers() & KeyModifierShift) == 0);
   QVERIFY((keyState.pollActiveModifiers() & KeyModifierNumLock) != 0);
+}
+
+void EiKeyStateTests::multiLayout_groupSwitch_mapsToCorrectKeysyms()
+{
+  TestAppUtil appUtil;
+  EventQueue eventQueue;
+  deskflow::EiKeyState keyState(nullptr, &eventQueue);
+
+  QTemporaryFile keymapFile;
+  QVERIFY(keymapFile.open());
+  const QByteArray keymapData = QByteArray::fromRawData(MultiLayoutKeymap, sizeof(MultiLayoutKeymap) - 1);
+  QCOMPARE(keymapFile.write(keymapData), keymapData.size());
+  QVERIFY(keymapFile.flush());
+  keyState.init(keymapFile.handle(), keymapFile.size());
+
+  // Group 0: English (US)
+  keyState.setActiveGroup(0);
+  QCOMPARE(keyState.pollActiveGroup(), 0);
+  QCOMPARE(keyState.mapKeyFromKeyval(KeyAKeycode), static_cast<KeyID>('a'));
+
+  // Group 0 + Shift: uppercase 'A'
+  keyState.updateXkbState(LeftShiftKeycode, true);
+  QCOMPARE(keyState.mapKeyFromKeyval(KeyAKeycode), static_cast<KeyID>('A'));
+  keyState.updateXkbState(LeftShiftKeycode, false);
+
+  // Switch to Group 1: Russian
+  keyState.setActiveGroup(1);
+  QCOMPARE(keyState.pollActiveGroup(), 1);
+  QCOMPARE(keyState.mapKeyFromKeyval(KeyAKeycode), static_cast<KeyID>(0x0444)); // Cyrillic_ef ('ф')
+
+  // Group 1 + Shift: uppercase Cyrillic_EF ('Ф')
+  keyState.updateXkbState(LeftShiftKeycode, true);
+  QCOMPARE(keyState.mapKeyFromKeyval(KeyAKeycode), static_cast<KeyID>(0x0424)); // Cyrillic_EF ('Ф')
+  keyState.updateXkbState(LeftShiftKeycode, false);
 }
 
 QTEST_MAIN(EiKeyStateTests)

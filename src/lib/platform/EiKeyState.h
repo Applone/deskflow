@@ -35,6 +35,7 @@ public:
   void pollPressedKeys(KeyButtonSet &pressedKeys) const override;
   KeyID mapKeyFromKeyval(std::uint32_t keyval) const;
   void updateXkbState(std::uint32_t keyval, bool isPressed);
+  void setActiveGroup(std::int32_t group);
   void clearStaleModifiers() override;
 
 protected:

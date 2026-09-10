@@ -18,6 +18,7 @@ class EiKeyStateTests : public QObject
 private Q_SLOTS:
   void initTestCase();
   void clearStaleModifiers_shiftDownAndNumLockOn_shiftClearedAndNumLockPreserved();
+  void multiLayout_groupSwitch_mapsToCorrectKeysyms();
 
 private:
   Arch m_arch;
