@@ -217,16 +217,12 @@ int32_t WaylandKeyboardManager::getActiveGroup()
     return 0;
   }
 
-  // On KDE, query live DBus if connected
-  if (QDBusConnection::sessionBus().isConnected()) {
-    QDBusInterface kbd("org.kde.keyboard", "/Layouts", "org.kde.KeyboardLayouts", QDBusConnection::sessionBus());
-    if (kbd.isValid()) {
-      QDBusReply<uint> reply = kbd.call("getLayout");
-      if (reply.isValid()) {
-        m_activeGroup = static_cast<int32_t>(reply.value());
-        return m_activeGroup;
-      }
-    }
+  // On KDE, the layout is tracked via the layoutChanged signal so the cached
+  // m_activeGroup is always current.  Avoid a synchronous D-Bus call on every
+  // key event — the repeated introspection + method calls flood the session
+  // bus and delay the portal "Input Capture started" notification.
+  if (m_kdeConnected) {
+    return m_activeGroup >= 0 ? m_activeGroup : 0;
   }
 
   // On GNOME, query gsettings mru-sources
