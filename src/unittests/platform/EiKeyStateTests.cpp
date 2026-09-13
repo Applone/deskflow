@@ -171,4 +171,56 @@ void EiKeyStateTests::multiLayout_groupSwitch_mapsToCorrectKeysyms()
   keyState.updateXkbState(LeftShiftKeycode, false);
 }
 
+void EiKeyStateTests::multiLayout_groupSwitchWhileShiftHeld_shiftNotStuck()
+{
+  TestAppUtil appUtil;
+  EventQueue eventQueue;
+  deskflow::EiKeyState keyState(nullptr, &eventQueue);
+
+  QTemporaryFile keymapFile;
+  QVERIFY(keymapFile.open());
+  const QByteArray keymapData = QByteArray::fromRawData(MultiLayoutKeymap, sizeof(MultiLayoutKeymap) - 1);
+  QCOMPARE(keymapFile.write(keymapData), keymapData.size());
+  QVERIFY(keymapFile.flush());
+  keyState.init(keymapFile.handle(), keymapFile.size());
+
+  keyState.setActiveGroup(0);
+
+  // Press and hold shift, then switch layout underneath it. Switching the group
+  // must not disturb the per-key tracking that update_key() maintains,
+  // otherwise the release below underflows and shift stays stuck down.
+  keyState.updateXkbState(LeftShiftKeycode, true);
+  QVERIFY((keyState.pollActiveModifiers() & KeyModifierShift) != 0);
+
+  keyState.setActiveGroup(1);
+  QCOMPARE(keyState.pollActiveGroup(), 1);
+  // Shift is still physically held, so it must still be reported.
+  QVERIFY((keyState.pollActiveModifiers() & KeyModifierShift) != 0);
+  QCOMPARE(keyState.mapKeyFromKeyval(KeyAKeycode), static_cast<KeyID>(0x0424));
+
+  keyState.updateXkbState(LeftShiftKeycode, false);
+  QVERIFY((keyState.pollActiveModifiers() & KeyModifierShift) == 0);
+  QCOMPARE(keyState.mapKeyFromKeyval(KeyAKeycode), static_cast<KeyID>(0x0444));
+}
+
+void EiKeyStateTests::multiLayout_groupBeyondKeymap_clampedToLastLayout()
+{
+  TestAppUtil appUtil;
+  EventQueue eventQueue;
+  deskflow::EiKeyState keyState(nullptr, &eventQueue);
+
+  QTemporaryFile keymapFile;
+  QVERIFY(keymapFile.open());
+  const QByteArray keymapData = QByteArray::fromRawData(MultiLayoutKeymap, sizeof(MultiLayoutKeymap) - 1);
+  QCOMPARE(keymapFile.write(keymapData), keymapData.size());
+  QVERIFY(keymapFile.flush());
+  keyState.init(keymapFile.handle(), keymapFile.size());
+
+  // The desktop may report a group the compositor keymap does not have; an
+  // out-of-range layout would otherwise resolve to NoSymbol.
+  keyState.setActiveGroup(7);
+  QCOMPARE(keyState.pollActiveGroup(), 1);
+  QCOMPARE(keyState.mapKeyFromKeyval(KeyAKeycode), static_cast<KeyID>(0x0444));
+}
+
 QTEST_MAIN(EiKeyStateTests)

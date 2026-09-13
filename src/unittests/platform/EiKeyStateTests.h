@@ -19,6 +19,8 @@ private Q_SLOTS:
   void initTestCase();
   void clearStaleModifiers_shiftDownAndNumLockOn_shiftClearedAndNumLockPreserved();
   void multiLayout_groupSwitch_mapsToCorrectKeysyms();
+  void multiLayout_groupSwitchWhileShiftHeld_shiftNotStuck();
+  void multiLayout_groupBeyondKeymap_clampedToLastLayout();
 
 private:
   Arch m_arch;

@@ -270,6 +270,7 @@ void PortalClipboard::serveSelectionTransfer(EiClipboard *cache, XdpSession *ses
     written += n;
   }
 
+  pipe.flush();
   xdp_session_selection_write_done(session, serial, true);
   LOG_DEBUG("clipboard selection transfer complete, bytes: %lld", static_cast<long long>(written));
 }

@@ -48,7 +48,7 @@ EiScreen::EiScreen(bool isPrimary, IEventQueue *events, bool usePortal)
       m_isOnScreen{isPrimary}
 {
   initEi();
-  m_keyState = new EiKeyState(this, events);
+
   // install event handlers
   m_events->addHandler(EventTypes::System, m_events->getSystemTarget(), [this](const auto &e) {
     handleSystemEvent(e);
@@ -58,13 +58,22 @@ EiScreen::EiScreen(bool isPrimary, IEventQueue *events, bool usePortal)
     m_events->addHandler(EventTypes::EIConnected, getEventTarget(), [this](const auto &e) {
       handleConnectedToEisEvent(e);
     });
+    if (!isPrimary) {
+      m_events->addHandler(EventTypes::EISessionClosed, getEventTarget(), [this](const auto &) {
+        handlePortalSessionClosed();
+      });
+    }
+  }
+
+  // Start the portal handshake before building the key state. Creating
+  // EiKeyState reads the desktop's keyboard layout configuration, which means
+  // synchronous session-bus traffic; doing that first delays the portal request
+  // and with it the compositor's "input capture started" notification.
+  if (usePortal) {
     if (isPrimary) {
       m_portalInputCapture = new PortalInputCapture(this, m_events);
       // Portal input capture manages its own clipboard
     } else {
-      m_events->addHandler(EventTypes::EISessionClosed, getEventTarget(), [this](const auto &) {
-        handlePortalSessionClosed();
-      });
       m_portalRemoteDesktop = new PortalRemoteDesktop(this, m_events);
       // Create clipboard for remote desktop (secondary screen)
       m_clipboard = new EiClipboard(kClipboardClipboard);
@@ -78,6 +87,8 @@ EiScreen::EiScreen(bool isPrimary, IEventQueue *events, bool usePortal)
     // Create clipboard for socket backend
     m_clipboard = new EiClipboard(kClipboardClipboard);
   }
+
+  m_keyState = new EiKeyState(this, events);
 
   // disable sleep if the flag is set
   if (Settings::value(Settings::Core::PreventSleep).toBool()) {
@@ -204,9 +215,18 @@ void EiScreen::getCursorPos(int32_t &x, int32_t &y) const
 
 void EiScreen::reconfigure(uint32_t activeSides)
 {
-  const static auto sidesText = sidesMaskToString(activeSides);
+  const auto sidesText = sidesMaskToString(activeSides);
   LOG_DEBUG("active sides: %s (0x%02x)", sidesText.c_str(), activeSides);
+
+  const auto previousSides = m_activeSides;
   m_activeSides = activeSides;
+
+  // Barriers are derived from the active sides. If the portal asked for zones
+  // before the server had a configuration, no barrier was installed and the
+  // session was never enabled - re-apply them now that the sides are known.
+  if (m_portalInputCapture && activeSides != previousSides) {
+    m_portalInputCapture->refreshBarriers();
+  }
 }
 
 std::uint32_t EiScreen::activeSides()
@@ -460,7 +480,11 @@ bool EiScreen::setClipboard(ClipboardID id, const IClipboard *clipboard)
     if (!targetClipboard) {
       return false;
     }
-    return IClipboard::copy(targetClipboard, clipboard);
+    const bool ok = IClipboard::copy(targetClipboard, clipboard);
+    if (ok && id == kClipboardClipboard) {
+      m_portalInputCapture->claimClipboard();
+    }
+    return ok;
   }
 
   // Otherwise use our own clipboard

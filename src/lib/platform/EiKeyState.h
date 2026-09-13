@@ -46,12 +46,18 @@ protected:
 private:
   std::uint32_t convertModMask(xkb_mod_mask_t xkbModMaskIn, bool mapMod2ToNumLock = false) const;
   void assignGeneratedModifiers(std::uint32_t keycode, KeyMap::KeyItem &item);
+  /// Clamp a desktop-reported group to a layout index the keymap actually has.
+  std::int32_t clampGroup(std::int32_t group) const;
 
   EiScreen *m_screen = nullptr;
 
   xkb_context *m_xkb = nullptr;
   xkb_keymap *m_xkbKeymap = nullptr;
   xkb_state *m_xkbState = nullptr;
+
+  /// Active layout group, or -1 when unknown. Mutable so the const pollers can
+  /// memoize it; -1 falls back to the xkb state's own effective layout.
+  mutable std::int32_t m_activeGroup = -1;
 };
 
 } // namespace deskflow

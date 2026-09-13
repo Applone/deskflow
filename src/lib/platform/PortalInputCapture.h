@@ -38,6 +38,11 @@ public:
   void disable();
   void release();
   void release(double x, double y);
+  /// Claim clipboard ownership on the portal session. Thread-safe.
+  void claimClipboard();
+  /// Recompute and re-apply the pointer barriers. Thread safe: the work is
+  /// marshalled onto the portal's own glib thread.
+  void refreshBarriers();
   bool isActive() const
   {
     return m_isActive;
@@ -47,6 +52,12 @@ private:
   void glibThread(const void *);
   gboolean timeoutHandler() const;
   gboolean initSession();
+
+  /// Attach a one-shot idle source to our private GMainContext.
+  void addIdle(GSourceFunc function, gpointer data) const;
+  /// Attach a one-shot timeout source to our private GMainContext.
+  void addTimeout(guint intervalMs, GSourceFunc function, gpointer data) const;
+
   void setupSession(XdpInputCaptureSession *session);
   void handleStart(GObject *object, GAsyncResult *res);
   void handleInitSession(GObject *object, GAsyncResult *res);
@@ -61,6 +72,11 @@ private:
   void handleSelectionTransfer(XdpSession *session, const char *mimeType, uint32_t serial) const;
   void readClipboardSelection(XdpSession *session) const;
   void claimClipboardOwnership(XdpSession *session) const;
+#ifdef HAVE_LIBPORTAL_CLIPBOARD
+  /// Queue the post-activation clipboard read instead of doing it inline.
+  void scheduleClipboardRead();
+  void readClipboardAfterActivation();
+#endif
 
   /// g_signal_connect callback wrapper
   static void sessionClosed(XdpSession *session, const gpointer data)
@@ -151,7 +167,12 @@ private:
   IEventQueue *m_events = nullptr;
   int m_portalVersion = 0;
 
-  Thread *m_glibThread;
+  Thread *m_glibThread = nullptr;
+  // Private GMainContext. Must NOT be the default context: Qt's main-thread
+  // event dispatcher (QEventDispatcherGlib) iterates g_main_context_default(),
+  // and two threads iterating one context block each other in
+  // g_main_context_wait(), which delays every portal reply we depend on.
+  GMainContext *m_glibContext = nullptr;
   GMainLoop *m_glibMainLoop = nullptr;
 
   XdpPortal *m_portal = nullptr;
@@ -167,6 +188,12 @@ private:
   bool m_enabled = false;
   bool m_isActive = false;
   std::uint32_t m_activationId = 0;
+
+  /// Coalesces deferred clipboard reads across rapid switches.
+  bool m_clipboardReadPending = false;
+  gint64 m_lastActivatedAt = 0;
+  gint64 m_lastDisabledAt = 0;
+  guint m_reenableBackoffMs = 0;
 
   std::vector<XdpInputCapturePointerBarrier *> m_barriers;
   std::vector<BarrierInfo> m_barrierInfo;

@@ -20,15 +20,29 @@ namespace deskflow {
 
 PortalRemoteDesktop::PortalRemoteDesktop(EiScreen *screen, IEventQueue *events)
     : m_screen{screen},
-      m_events{events},
-      m_portal{xdp_portal_new()}
+      m_events{events}
 {
-  m_glibMainLoop = g_main_loop_new(nullptr, true);
+  // Run the portal on a context of our own. Qt's main-thread event dispatcher
+  // iterates g_main_context_default(), and two threads iterating one context
+  // stall each other in g_main_context_wait(). xdp_portal_new() captures the
+  // thread-default context, so push ours before creating the portal.
+  m_glibContext = g_main_context_new();
+  g_main_context_push_thread_default(m_glibContext);
+  m_portal = xdp_portal_new();
+  m_glibMainLoop = g_main_loop_new(m_glibContext, true);
+  g_main_context_pop_thread_default(m_glibContext);
 
   auto tMethodJob = new TMethodJob<PortalRemoteDesktop>(this, &PortalRemoteDesktop::glibThread);
   m_glibThread = new Thread(tMethodJob);
 
   reconnect(0);
+}
+
+void PortalRemoteDesktop::addGlibSource(GSource *source, GSourceFunc function, gpointer data) const
+{
+  g_source_set_callback(source, function, data, nullptr);
+  g_source_attach(source, m_glibContext);
+  g_source_unref(source);
 }
 
 PortalRemoteDesktop::~PortalRemoteDesktop()
@@ -56,6 +70,11 @@ PortalRemoteDesktop::~PortalRemoteDesktop()
     g_object_unref(m_session);
   g_object_unref(m_portal);
 
+  if (m_glibContext) {
+    g_main_context_unref(m_glibContext);
+    m_glibContext = nullptr;
+  }
+
   free(m_sessionRestoreToken);
 }
 
@@ -69,9 +88,9 @@ void PortalRemoteDesktop::reconnect(unsigned int timeout)
   auto initCallback = [](gpointer data) { return static_cast<PortalRemoteDesktop *>(data)->initSession(); };
 
   if (timeout > 0)
-    g_timeout_add(timeout, initCallback, this);
+    addGlibSource(g_timeout_source_new(timeout), initCallback, this);
   else
-    g_idle_add(initCallback, this);
+    addGlibSource(g_idle_source_new(), initCallback, this);
 }
 
 void PortalRemoteDesktop::handleSessionClosed(XdpSession *session)
@@ -220,10 +239,16 @@ void PortalRemoteDesktop::glibThread(const void *)
 {
   auto context = g_main_loop_get_context(m_glibMainLoop);
 
+  // Own the context on this thread so async operations started from portal
+  // callbacks attach their sources here and not to the default context.
+  g_main_context_push_thread_default(context);
+
   while (g_main_loop_is_running(m_glibMainLoop)) {
     Thread::testCancel();
     g_main_context_iteration(context, true);
   }
+
+  g_main_context_pop_thread_default(context);
 }
 
 void PortalRemoteDesktop::claimClipboard() const

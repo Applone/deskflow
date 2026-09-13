@@ -36,6 +36,9 @@ private:
   void handleSelectionOwnerChanged(XdpSession *session, char **mimeTypes, gboolean isOwner) const;
   void reconnect(unsigned int timeout = 1000);
 
+  /// Attach an already-created one-shot GSource to our private GMainContext.
+  void addGlibSource(GSource *source, GSourceFunc function, gpointer data) const;
+
   static void handleSessionClosedCallback(XdpSession *session, gpointer data)
   {
     static_cast<PortalRemoteDesktop *>(data)->handleSessionClosed(session);
@@ -55,7 +58,10 @@ private:
   EiScreen *m_screen;
   IEventQueue *m_events;
 
-  Thread *m_glibThread;
+  Thread *m_glibThread = nullptr;
+  // Private GMainContext; must not be the default context, which Qt's
+  // main-thread event dispatcher already iterates.
+  GMainContext *m_glibContext = nullptr;
   GMainLoop *m_glibMainLoop = nullptr;
 
   XdpPortal *m_portal = nullptr;

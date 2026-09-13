@@ -169,20 +169,42 @@ bool PortalInputCapture::getClosestReleaseBarrier(
 PortalInputCapture::PortalInputCapture(EiScreen *screen, IEventQueue *events)
     : m_screen{screen},
       m_events{events},
-      m_portalVersion(0),
-      m_portal{xdp_portal_new()}
+      m_portalVersion(0)
 {
   // Create clipboard for primary clipboard ID
   m_clipboard = new EiClipboard(kClipboardClipboard);
 
-  m_glibMainLoop = g_main_loop_new(nullptr, true);
+  // Run the portal on a context of our own. xdp_portal_new() captures the
+  // thread-default context for its internal GDBus connection, so the context
+  // has to be pushed *before* the portal is created.
+  m_glibContext = g_main_context_new();
+  g_main_context_push_thread_default(m_glibContext);
+  m_portal = xdp_portal_new();
+  m_glibMainLoop = g_main_loop_new(m_glibContext, true);
+  g_main_context_pop_thread_default(m_glibContext);
 
   auto tMethodJob = new TMethodJob<PortalInputCapture>(this, &PortalInputCapture::glibThread);
   m_glibThread = new Thread(tMethodJob);
 
   auto captureCallback = [](gpointer data) { return static_cast<PortalInputCapture *>(data)->initSession(); };
 
-  g_idle_add(captureCallback, this);
+  addIdle(captureCallback, this);
+}
+
+void PortalInputCapture::addIdle(GSourceFunc function, gpointer data) const
+{
+  GSource *source = g_idle_source_new();
+  g_source_set_callback(source, function, data, nullptr);
+  g_source_attach(source, m_glibContext);
+  g_source_unref(source);
+}
+
+void PortalInputCapture::addTimeout(guint intervalMs, GSourceFunc function, gpointer data) const
+{
+  GSource *source = g_timeout_source_new(intervalMs);
+  g_source_set_callback(source, function, data, nullptr);
+  g_source_attach(source, m_glibContext);
+  g_source_unref(source);
 }
 
 PortalInputCapture::~PortalInputCapture()
@@ -220,6 +242,11 @@ PortalInputCapture::~PortalInputCapture()
   m_barriers.clear();
   g_object_unref(m_portal);
 
+  if (m_glibContext) {
+    g_main_context_unref(m_glibContext);
+    m_glibContext = nullptr;
+  }
+
   delete m_clipboard;
 }
 
@@ -247,6 +274,28 @@ void PortalInputCapture::handleSessionClosed(XdpSession *session)
   m_signals.at(Signal::SessionClosed) = 0;
 }
 
+void PortalInputCapture::claimClipboard()
+{
+#ifdef HAVE_LIBPORTAL_CLIPBOARD
+  if (!m_glibContext) {
+    return;
+  }
+  addIdle(
+      [](gpointer data) -> gboolean {
+        auto *self = static_cast<PortalInputCapture *>(data);
+        if (self->m_session) {
+          XdpSession *session = xdp_input_capture_session_get_session(self->m_session);
+          if (session && xdp_session_is_clipboard_enabled(session)) {
+            self->claimClipboardOwnership(session);
+          }
+        }
+        return G_SOURCE_REMOVE;
+      },
+      this
+  );
+#endif
+}
+
 void PortalInputCapture::claimClipboardOwnership([[maybe_unused]] XdpSession *session) const
 {
 #ifdef HAVE_LIBPORTAL_CLIPBOARD
@@ -257,7 +306,12 @@ void PortalInputCapture::claimClipboardOwnership([[maybe_unused]] XdpSession *se
 void PortalInputCapture::readClipboardSelection(XdpSession *session) const
 {
 #ifdef HAVE_LIBPORTAL_CLIPBOARD
-  const qint64 maxBytes = static_cast<qint64>(m_screen->maximumClipboardSize()) * 1024;
+  // maximumClipboardSize() defaults to INT_MAX KB, i.e. no cap at all, which
+  // makes a single read unbounded in both time and memory. Clamp it.
+  constexpr qint64 kHardCapBytes = 32 * 1024 * 1024;
+  const auto requested = static_cast<qint64>(m_screen->maximumClipboardSize());
+  const qint64 requestedBytes = (requested > kHardCapBytes / 1024) ? kHardCapBytes : requested * 1024;
+  const qint64 maxBytes = std::min(requestedBytes, kHardCapBytes);
   LOG_DEBUG("clipboard read cap: %lld bytes", static_cast<long long>(maxBytes));
 
   const char **mimeTypes = xdp_session_get_selection_mime_types(session);
@@ -276,10 +330,6 @@ void PortalInputCapture::readClipboardSelection(XdpSession *session) const
 void PortalInputCapture::handleSelectionTransfer(XdpSession *session, const char *mimeType, uint32_t serial) const
 {
 #ifdef HAVE_LIBPORTAL_CLIPBOARD
-  if (m_isActive) {
-    LOG_DEBUG("skipping clipboard selection transfer, clipboard is active");
-    return;
-  }
   PortalClipboard::serveSelectionTransfer(m_clipboard, session, mimeType, serial);
 #else
   (void)session;
@@ -306,7 +356,7 @@ void PortalInputCapture::setupSession(XdpInputCaptureSession *session)
       Settings::setValue(Settings::Server::XdpClipboardRetried, true);
       g_object_unref(m_session);
       m_session = nullptr;
-      g_idle_add([](gpointer data) { return static_cast<PortalInputCapture *>(data)->initSession(); }, this);
+      addIdle([](gpointer data) { return static_cast<PortalInputCapture *>(data)->initSession(); }, this);
       return;
     }
   }
@@ -635,10 +685,33 @@ gboolean PortalInputCapture::initSession()
   return false;
 }
 
+void PortalInputCapture::refreshBarriers()
+{
+  if (!m_glibContext) {
+    return;
+  }
+
+  addIdle(
+      [](gpointer data) -> gboolean {
+        auto *self = static_cast<PortalInputCapture *>(data);
+        if (self->m_session) {
+          LOG_DEBUG("re-applying input capture pointer barriers");
+          self->handleZonesChanged(self->m_session, nullptr);
+        }
+        return G_SOURCE_REMOVE;
+      },
+      this
+  );
+}
+
 void PortalInputCapture::enable()
 {
   if (!m_enabled) {
-    LOG_DEBUG("enabling the portal input capture session");
+    const auto sinceActivation =
+        (m_lastActivatedAt > 0) ? (g_get_monotonic_time() - m_lastActivatedAt) / 1000 : gint64{-1};
+    LOG_DEBUG(
+        "enabling the portal input capture session (%" G_GINT64_FORMAT " ms since last activation)", sinceActivation
+    );
     xdp_input_capture_session_enable(m_session);
     m_enabled = true;
   }
@@ -680,19 +753,30 @@ void PortalInputCapture::handleDisabled(const XdpInputCaptureSession *, const GV
   m_enabled = false;
   m_isActive = false;
 
-  // FIXME: need some better heuristics here of when we want to enable again
-  // But we don't know *why* we got disabled (and it's doubtfull we ever
-  // will), so we just assume that the zones will change or something and we
-  // can re-enable again
-  // ... very soon
-  g_timeout_add(
-      1000,
-      [](gpointer data) -> gboolean {
-        static_cast<PortalInputCapture *>(data)->enable();
-        return false;
-      },
-      this
-  );
+  // We don't know *why* we got disabled, so just try again. A flat one second
+  // wait here is a guaranteed one second of dead time on every disable/enable
+  // cycle; try immediately and only back off if it keeps happening, which is
+  // the case the delay was really meant for.
+  const auto now = g_get_monotonic_time();
+  if (now - m_lastDisabledAt > 5 * G_USEC_PER_SEC) {
+    m_reenableBackoffMs = 0;
+  } else {
+    m_reenableBackoffMs = (m_reenableBackoffMs == 0) ? 250 : std::min(m_reenableBackoffMs * 2, 2000u);
+  }
+  m_lastDisabledAt = now;
+
+  LOG_DEBUG("re-enabling input capture in %u ms", m_reenableBackoffMs);
+
+  const auto reenable = [](gpointer data) -> gboolean {
+    static_cast<PortalInputCapture *>(data)->enable();
+    return G_SOURCE_REMOVE;
+  };
+
+  if (m_reenableBackoffMs == 0) {
+    addIdle(reenable, this);
+  } else {
+    addTimeout(m_reenableBackoffMs, reenable, this);
+  }
 }
 
 void PortalInputCapture::handleActivated(
@@ -700,6 +784,7 @@ void PortalInputCapture::handleActivated(
 )
 {
   LOG_DEBUG("portal cb activated, id=%d", activationId);
+  m_lastActivatedAt = g_get_monotonic_time();
 
   if (options) {
     gdouble x;
@@ -736,28 +821,73 @@ void PortalInputCapture::handleActivated(
   m_isActive = true;
 
 #ifdef HAVE_LIBPORTAL_CLIPBOARD
-  if (m_session) {
-    LOG_DEBUG("reading clipboard selection on activation");
-    m_screen->sendClipboardEvent(EventTypes::ClipboardGrabbed, kClipboardClipboard);
-
-    XdpSession *session = xdp_input_capture_session_get_session(m_session);
-    const char **mimeTypes = xdp_session_get_selection_mime_types(session);
-
-    if (mimeTypes && mimeTypes[0]) {
-      LOG_DEBUG("clipboard current selection mime types: %s", PortalClipboard::formatMimeTypes(mimeTypes).constData());
-      if (!xdp_session_is_selection_owned_by_session(session))
-        readClipboardSelection(session);
-    } else {
-      LOG_DEBUG("no current clipboard selection");
-    }
-
-    claimClipboardOwnership(session);
-    LOG_DEBUG("activation clipboard handling complete");
-  } else {
-    LOG_WARN("input capture activated without a session, skipping clipboard read");
-  }
+  // Do NOT read the clipboard here. Reading a selection drains a pipe from the
+  // compositor chunk by chunk, with a poll timeout per chunk, and it runs on
+  // this glib thread - the same thread that has to dispatch the rest of the
+  // portal conversation. With a large selection (a screenshot, a big document)
+  // that is seconds of latency on every single screen switch, which is why
+  // switching feels instant right after launch and sluggish once you have
+  // copied something substantial. Hand it to an idle callback so activation
+  // returns immediately.
+  scheduleClipboardRead();
 #endif
 }
+
+#ifdef HAVE_LIBPORTAL_CLIPBOARD
+void PortalInputCapture::scheduleClipboardRead()
+{
+  if (m_clipboardReadPending) {
+    // Coalesce: a switch storm must not queue up N full clipboard reads.
+    LOG_DEBUG("clipboard read already pending, not queuing another");
+    return;
+  }
+  m_clipboardReadPending = true;
+
+  addIdle(
+      [](gpointer data) -> gboolean {
+        static_cast<PortalInputCapture *>(data)->readClipboardAfterActivation();
+        return G_SOURCE_REMOVE;
+      },
+      this
+  );
+}
+
+void PortalInputCapture::readClipboardAfterActivation()
+{
+  m_clipboardReadPending = false;
+
+  if (!m_session) {
+    LOG_WARN("input capture activated without a session, skipping clipboard read");
+    return;
+  }
+
+  if (!m_isActive) {
+    LOG_DEBUG("no longer active, skipping deferred clipboard read");
+    return;
+  }
+
+  const auto startedAt = g_get_monotonic_time();
+
+  m_screen->sendClipboardEvent(EventTypes::ClipboardGrabbed, kClipboardClipboard);
+
+  XdpSession *session = xdp_input_capture_session_get_session(m_session);
+  const char **mimeTypes = xdp_session_get_selection_mime_types(session);
+
+  if (mimeTypes && mimeTypes[0]) {
+    LOG_DEBUG("clipboard current selection mime types: %s", PortalClipboard::formatMimeTypes(mimeTypes).constData());
+    if (!xdp_session_is_selection_owned_by_session(session))
+      readClipboardSelection(session);
+  } else {
+    LOG_DEBUG("no current clipboard selection");
+  }
+
+  const auto elapsedMs = (g_get_monotonic_time() - startedAt) / 1000;
+  LOG_DEBUG("activation clipboard handling complete in %" G_GINT64_FORMAT " ms", elapsedMs);
+  if (elapsedMs > 250) {
+    LOG_INFO("clipboard read took %" G_GINT64_FORMAT " ms; consider lowering the clipboard size limit", elapsedMs);
+  }
+}
+#endif
 
 void PortalInputCapture::handleDeactivated(
     const XdpInputCaptureSession *, const std::uint32_t activationId, const GVariant *
@@ -867,10 +997,16 @@ void PortalInputCapture::glibThread(const void *)
 
   LOG_DEBUG("glib thread running");
 
+  // Own the context on this thread so async operations started from portal
+  // callbacks attach their sources here and not to the default context.
+  g_main_context_push_thread_default(context);
+
   while (g_main_loop_is_running(m_glibMainLoop)) {
     Thread::testCancel();
     g_main_context_iteration(context, true);
   }
+
+  g_main_context_pop_thread_default(context);
 
   LOG_DEBUG("shutting down glib thread");
 }
